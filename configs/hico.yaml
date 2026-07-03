@@ -67,9 +67,9 @@ MODEL:
     INIT_SCALE: 0.1
     DETACH_BOXES: true
   VITPOSE:
-    ENABLED: false
-    CONFIG: ""
-    CHECKPOINT: ""
+    ENABLED: true
+    CONFIG: "/media/qdu/2.0T/zgy/projects/SL-HOI/mmpose/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py"
+    CHECKPOINT: "/media/qdu/2.0T/zgy/projects/SL-HOI/weights/Vitpose/td-hm_ViTPose-base_8xb64-210e_coco-256x192-216eae50_20230314.pth"
     NUM_KEYPOINTS: 17
     SCORE_THR: 0.05
     IMAGE_FORMAT: "RGB"

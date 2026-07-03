@@ -16,14 +16,79 @@ EXP_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/exps1/hico_ov"
 DATA_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/data/hico_20160224_det/"
 DINO_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/weights/dinov3"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MMPOSE_DIR="${PROJECT_DIR}/third_party/mmpose"
-VITPOSE_DIR="${PROJECT_DIR}/weights/vitpose"
-VITPOSE_CONFIG="${MMPOSE_DIR}/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py"
-VITPOSE_CHECKPOINT="${VITPOSE_DIR}/vitpose-b.pth"
+
+if [ -z "${MMPOSE_DIR}" ]; then
+    if [ -d "${PROJECT_DIR}/third_party/mmpose/mmpose/apis" ]; then
+        MMPOSE_DIR="${PROJECT_DIR}/third_party/mmpose"
+    elif [ -d "${PROJECT_DIR}/mmpose/mmpose/apis" ]; then
+        MMPOSE_DIR="${PROJECT_DIR}/mmpose"
+    else
+        MMPOSE_DIR="${PROJECT_DIR}/third_party/mmpose"
+    fi
+fi
+
+if [ -z "${VITPOSE_DIR}" ]; then
+    if [ -d "${PROJECT_DIR}/weights/Vitpose" ]; then
+        VITPOSE_DIR="${PROJECT_DIR}/weights/Vitpose"
+    else
+        VITPOSE_DIR="${PROJECT_DIR}/weights/vitpose"
+    fi
+fi
+
+DEFAULT_VITPOSE_CONFIG="${MMPOSE_DIR}/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py"
+if [ ! -f "${DEFAULT_VITPOSE_CONFIG}" ] && [ -f "${MMPOSE_DIR}/mmpose/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py" ]; then
+    DEFAULT_VITPOSE_CONFIG="${MMPOSE_DIR}/mmpose/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py"
+fi
+VITPOSE_CONFIG="${VITPOSE_CONFIG:-${DEFAULT_VITPOSE_CONFIG}}"
+
+if [ -z "${VITPOSE_CHECKPOINT}" ]; then
+    VITPOSE_CHECKPOINT="${VITPOSE_DIR}/vitpose-b.pth"
+    if [ ! -f "${VITPOSE_CHECKPOINT}" ]; then
+        FOUND_VITPOSE_CHECKPOINT=$(find "${VITPOSE_DIR}" -maxdepth 1 -type f \( -name "*ViTPose-base*.pth" -o -name "*vitpose*b*.pth" -o -name "*.pth" \) 2>/dev/null | head -n 1)
+        if [ -n "${FOUND_VITPOSE_CHECKPOINT}" ]; then
+            VITPOSE_CHECKPOINT="${FOUND_VITPOSE_CHECKPOINT}"
+        fi
+    fi
+fi
 export PYTHONPATH="${MMPOSE_DIR}:${PYTHONPATH}"
 
 CONFIG_FILE="configs/hico.yaml"
 DEFAULT_CONFIG="configs/base.yaml"
+
+echo "Using MMPose dir: ${MMPOSE_DIR}"
+echo "Using ViTPose config: ${VITPOSE_CONFIG}"
+echo "Using ViTPose checkpoint: ${VITPOSE_CHECKPOINT}"
+
+if [ ! -f "${VITPOSE_CONFIG}" ]; then
+    echo "Error: ViTPose config not found: ${VITPOSE_CONFIG}"
+    echo "Place the full MMPose repo under third_party/mmpose, not only a single config file."
+    exit 1
+fi
+
+if [ ! -f "${VITPOSE_CHECKPOINT}" ]; then
+    echo "Error: ViTPose checkpoint not found: ${VITPOSE_CHECKPOINT}"
+    exit 1
+fi
+
+case "${VITPOSE_CHECKPOINT}" in
+    *.pth|*.pt|*.ckpt) ;;
+    *)
+        echo "Error: MODEL.VITPOSE.CHECKPOINT must point to a weight file such as vitpose-b.pth, not a config .py file."
+        echo "Current checkpoint path: ${VITPOSE_CHECKPOINT}"
+        exit 1
+        ;;
+esac
+
+python -c "import mmpose.apis, mmpose.utils" >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+    echo "Error: Python cannot import mmpose.apis."
+    echo "Expected a full MMPose package at: ${MMPOSE_DIR}"
+    echo "Fix on the server with one of:"
+    echo "  git clone https://github.com/open-mmlab/mmpose.git ${MMPOSE_DIR}"
+    echo "  pip install -e ${MMPOSE_DIR}"
+    echo "and make sure mmcv, mmengine, and mmpretrain are installed in the slhoi environment."
+    exit 1
+fi
 
 # --------- Training Phase ---------
 accelerate launch \
