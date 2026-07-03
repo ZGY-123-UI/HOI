@@ -79,9 +79,14 @@ case "${VITPOSE_CHECKPOINT}" in
         ;;
 esac
 
-python -c "import mmpose.apis, mmpose.utils" >/dev/null 2>&1
+python - <<'PY'
+import mmpose
+from mmpose.apis import init_model, inference_topdown
+from mmpose.utils import register_all_modules
+print(f"MMPose import ok: {getattr(mmpose, '__file__', 'namespace-package')}")
+PY
 if [ $? -ne 0 ]; then
-    echo "Error: Python cannot import mmpose.apis."
+    echo "Error: Python cannot import MMPose ViTPose APIs."
     echo "Expected a full MMPose package at: ${MMPOSE_DIR}"
     echo "Fix on the server with one of:"
     echo "  git clone https://github.com/open-mmlab/mmpose.git ${MMPOSE_DIR}"
