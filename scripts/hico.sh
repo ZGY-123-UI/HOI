@@ -15,6 +15,11 @@ export ACCELERATE_LOG_LEVEL=WARN
 EXP_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/exps3/hico"
 DATA_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/data/hico_20160224_det/"
 DINO_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/weights/dinov3"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MMPOSE_DIR="${PROJECT_DIR}/third_party/mmpose"
+VITPOSE_DIR="${PROJECT_DIR}/weights/vitpose"
+VITPOSE_CONFIG="${MMPOSE_DIR}/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py"
+VITPOSE_CHECKPOINT="${VITPOSE_DIR}/vitpose-b.pth"
 
 CONFIG_FILE="configs/hico.yaml"
 DEFAULT_CONFIG="configs/base.yaml"
@@ -37,7 +42,12 @@ accelerate launch \
     ZERO_SHOT.TYPE="default" \
     ZERO_SHOT.DEL_UNSEEN="false" \
     ZERO_SHOT.CLASSIFIER.TRAIN="params/hico/classifier_default.pt" \
-    ZERO_SHOT.CLASSIFIER.EVAL="params/hico/classifier_eval.pt"
+    ZERO_SHOT.CLASSIFIER.EVAL="params/hico/classifier_eval.pt" \
+    MODEL.RELATION_POSE_SCENE_ADAPTER.ENABLED="true" \
+    MODEL.VITPOSE.ENABLED="true" \
+    MODEL.VITPOSE.CONFIG="${VITPOSE_CONFIG}" \
+    MODEL.VITPOSE.CHECKPOINT="${VITPOSE_CHECKPOINT}" \
+    MODEL.VITPOSE.NUM_KEYPOINTS=17
 
 
 ### --------- Evaluation Phase ---------
