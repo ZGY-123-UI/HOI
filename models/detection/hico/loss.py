@@ -168,6 +168,18 @@ class SetCriterionHOI(nn.Module):
                 masked_prob, target_classes, weights=None, alpha=self.alpha
             )
 
+        if "pred_ctx_hoi_logits" in outputs and log:
+            ctx_logits = outputs["pred_ctx_hoi_logits"]
+            if ctx_logits.shape != src_logits.shape:
+                raise ValueError(
+                    f"HOI context semantic logits dim mismatch: context={ctx_logits.shape}, "
+                    f"pred_hoi_logits={src_logits.shape}"
+                )
+            ctx_prob = _sigmoid(ctx_logits)
+            losses["loss_visual_text_consistency"] = self._neg_loss(
+                ctx_prob, target_classes, weights=None, alpha=self.alpha
+            )
+
         if log:
             _, pred = src_prob[idx].topk(topk, 1, True, True)
             acc = 0.0
@@ -285,8 +297,13 @@ class SetCriterionHOI(nn.Module):
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_interactions))
-        if "loss_semantic_consistency" in outputs_without_aux:
-            losses["loss_semantic_consistency"] = outputs_without_aux["loss_semantic_consistency"]
+        for scalar_loss in (
+            "loss_semantic_consistency",
+            "loss_mask_recovery",
+            "loss_global_proto_consistency",
+        ):
+            if scalar_loss in outputs_without_aux:
+                losses[scalar_loss] = outputs_without_aux[scalar_loss]
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:

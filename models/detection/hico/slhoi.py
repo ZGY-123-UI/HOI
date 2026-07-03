@@ -28,61 +28,378 @@ def _cfg_bool(node, key, default=False):
     return bool(value)
 
 
-class HOISemanticWordMaskEnhancer(nn.Module):
-    """HOI prompt word masking branch for masked semantic recovery and SCC."""
+class RelationPoseSceneAdapter(nn.Module):
+    """Build relation-, pose-, and scene-aware visual evidence tokens."""
 
-    def __init__(self, feature_dim, dim_feedforward=4096, dropout=0.1, temperature=1.0):
+    def __init__(
+        self,
+        feature_dim,
+        scene_dim,
+        num_keypoints=17,
+        dim_feedforward=4096,
+        dropout=0.1,
+        init_scale=0.1,
+        eps=1e-6,
+    ):
         super().__init__()
-        self.temperature = max(float(temperature), 1e-6)
-        self.raw_prompt_proj = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(feature_dim, feature_dim),
+        self.num_keypoints = int(num_keypoints)
+        self.eps = float(eps)
+
+        canonical_offsets = torch.tensor(
+            [
+                [0.00, -0.42],
+                [-0.06, -0.45],
+                [0.06, -0.45],
+                [-0.12, -0.42],
+                [0.12, -0.42],
+                [-0.22, -0.24],
+                [0.22, -0.24],
+                [-0.34, -0.04],
+                [0.34, -0.04],
+                [-0.40, 0.16],
+                [0.40, 0.16],
+                [-0.16, 0.12],
+                [0.16, 0.12],
+                [-0.18, 0.34],
+                [0.18, 0.34],
+                [-0.18, 0.48],
+                [0.18, 0.48],
+            ],
+            dtype=torch.float32,
         )
-        self.masked_recover = nn.Sequential(
-            nn.Linear(feature_dim * 2, dim_feedforward),
+        if self.num_keypoints > canonical_offsets.shape[0]:
+            pad = canonical_offsets.new_zeros(self.num_keypoints - canonical_offsets.shape[0], 2)
+            canonical_offsets = torch.cat([canonical_offsets, pad], dim=0)
+        self.register_buffer("canonical_offsets", canonical_offsets[: self.num_keypoints])
+
+        bottleneck_dim = min(max(feature_dim // 2, 512), dim_feedforward)
+        self.relation_encoder = MLP(12, bottleneck_dim, feature_dim, 3)
+        self.pose_encoder = MLP(self.num_keypoints * 6, bottleneck_dim, feature_dim, 3)
+        self.scene_encoder = MLP(scene_dim + 4, bottleneck_dim, feature_dim, 3)
+
+        self.relation_norm = nn.LayerNorm(feature_dim)
+        self.pose_norm = nn.LayerNorm(feature_dim)
+        self.scene_norm = nn.LayerNorm(feature_dim)
+        self.context_gate = nn.Linear(feature_dim * 4, 4)
+        self.context_fuse = nn.Sequential(
+            nn.Linear(feature_dim * 4, dim_feedforward),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(dim_feedforward, feature_dim),
+            nn.LayerNorm(feature_dim),
         )
-        self.raw_norm = nn.LayerNorm(feature_dim)
-        self.ref_norm = nn.LayerNorm(feature_dim)
+        self.context_scale = nn.Parameter(torch.tensor(float(init_scale)))
 
-    def _prompt_context(self, pair_feature, text_embedding):
-        logits = torch.matmul(pair_feature, text_embedding.t()) / self.temperature
-        return torch.softmax(logits, dim=-1).matmul(text_embedding)
+    def forward(self, pair_feature, human_boxes, object_boxes, token_outputs=None, pose_keypoints=None):
+        human_boxes = human_boxes.to(device=pair_feature.device, dtype=pair_feature.dtype)
+        object_boxes = object_boxes.to(device=pair_feature.device, dtype=pair_feature.dtype)
+        keypoints = self._prepare_keypoints(human_boxes, pose_keypoints)
 
-    def forward(self, pair_feature, raw_text_embedding, masked_text_embedding, logit_scale):
-        raw_text_embedding = F.normalize(
-            raw_text_embedding.to(device=pair_feature.device, dtype=pair_feature.dtype), dim=-1
+        relation = self.relation_norm(self.relation_encoder(self._build_spatial_features(human_boxes, object_boxes)))
+        pose_inputs = torch.cat(
+            [self._build_pose_features(human_boxes, keypoints), self._build_contact_features(object_boxes, keypoints)],
+            dim=-1,
         )
-        masked_text_embedding = F.normalize(
+        pose = self.pose_norm(self.pose_encoder(pose_inputs))
+        scene = self.scene_norm(self.scene_encoder(self._build_scene_features(human_boxes, object_boxes, token_outputs)))
+
+        gate = torch.softmax(self.context_gate(torch.cat([pair_feature, relation, pose, scene], dim=-1)), dim=-1)
+        gated = torch.cat(
+            [
+                pair_feature,
+                gate[..., 1:2] * relation,
+                gate[..., 2:3] * pose,
+                gate[..., 3:4] * scene,
+            ],
+            dim=-1,
+        )
+        context = F.normalize(pair_feature + self.context_scale * self.context_fuse(gated), dim=-1)
+        return {
+            "relation": F.normalize(relation, dim=-1),
+            "pose": F.normalize(pose, dim=-1),
+            "scene": F.normalize(scene, dim=-1),
+            "context": context,
+            "gate": gate,
+        }
+
+    def _prepare_keypoints(self, human_boxes, pose_keypoints):
+        if pose_keypoints is None:
+            center = human_boxes[..., :2].unsqueeze(-2)
+            size = human_boxes[..., 2:].clamp(min=self.eps).unsqueeze(-2)
+            offsets = self.canonical_offsets.to(device=human_boxes.device, dtype=human_boxes.dtype)
+            offsets = offsets.view(*([1] * (human_boxes.dim() - 1)), self.num_keypoints, 2)
+            xy = center + offsets * size
+            conf = torch.ones_like(xy[..., :1])
+            return torch.cat([xy, conf], dim=-1)
+
+        keypoints = pose_keypoints.to(device=human_boxes.device, dtype=human_boxes.dtype)
+        if keypoints.dim() == human_boxes.dim():
+            keypoints = keypoints.unsqueeze(0).expand(human_boxes.shape[0], *keypoints.shape)
+        elif keypoints.dim() == human_boxes.dim() + 1 and keypoints.shape[0] == 1 and human_boxes.shape[0] != 1:
+            keypoints = keypoints.expand(human_boxes.shape[0], *keypoints.shape[1:])
+        if keypoints.shape[-1] == 2:
+            keypoints = torch.cat([keypoints, torch.ones_like(keypoints[..., :1])], dim=-1)
+        if keypoints.shape[-2] < self.num_keypoints:
+            pad_shape = (*keypoints.shape[:-2], self.num_keypoints - keypoints.shape[-2], keypoints.shape[-1])
+            keypoints = torch.cat([keypoints, keypoints.new_zeros(pad_shape)], dim=-2)
+        return keypoints[..., : self.num_keypoints, :3]
+
+    def _build_pose_features(self, human_boxes, keypoints):
+        center = human_boxes[..., :2].unsqueeze(-2)
+        size = human_boxes[..., 2:].clamp(min=self.eps).unsqueeze(-2)
+        rel_xy = (keypoints[..., :2] - center) / size
+        pose = torch.cat([rel_xy, keypoints[..., 2:3].clamp(0.0, 1.0)], dim=-1)
+        return pose.flatten(-2)
+
+    def _build_spatial_features(self, human_boxes, object_boxes):
+        hcx, hcy, hw, hh = human_boxes.clamp(0.0, 1.0).unbind(-1)
+        ocx, ocy, ow, oh = object_boxes.clamp(0.0, 1.0).unbind(-1)
+        hw = hw.clamp(min=self.eps)
+        hh = hh.clamp(min=self.eps)
+        ow = ow.clamp(min=self.eps)
+        oh = oh.clamp(min=self.eps)
+
+        raw_dx = ocx - hcx
+        raw_dy = ocy - hcy
+        dist = torch.sqrt(raw_dx.square() + raw_dy.square() + self.eps)
+        human_diag = torch.sqrt(hw.square() + hh.square() + self.eps)
+        h_area = (hw * hh).clamp(min=self.eps)
+        o_area = (ow * oh).clamp(min=self.eps)
+
+        human_xyxy = self._box_cxcywh_to_xyxy(torch.stack([hcx, hcy, hw, hh], dim=-1))
+        object_xyxy = self._box_cxcywh_to_xyxy(torch.stack([ocx, ocy, ow, oh], dim=-1))
+        lt = torch.maximum(human_xyxy[..., :2], object_xyxy[..., :2])
+        rb = torch.minimum(human_xyxy[..., 2:], object_xyxy[..., 2:])
+        wh = (rb - lt).clamp(min=0.0)
+        inter = wh[..., 0] * wh[..., 1]
+        union = (h_area + o_area - inter).clamp(min=self.eps)
+        iou = inter / union
+
+        return torch.stack(
+            [
+                raw_dx / hw,
+                raw_dy / hh,
+                raw_dx / ow,
+                raw_dy / oh,
+                torch.log(ow / hw),
+                torch.log(oh / hh),
+                iou,
+                o_area / h_area,
+                dist / human_diag,
+                raw_dx / dist,
+                raw_dy / dist,
+                union,
+            ],
+            dim=-1,
+        )
+
+    def _build_contact_features(self, object_boxes, keypoints):
+        object_xyxy = self._box_cxcywh_to_xyxy(object_boxes.clamp(0.0, 1.0))
+        kp_xy = keypoints[..., :2].clamp(0.0, 1.0)
+        kp_conf = keypoints[..., 2:3].clamp(0.0, 1.0)
+
+        left_top = object_xyxy[..., :2].unsqueeze(-2)
+        right_bottom = object_xyxy[..., 2:].unsqueeze(-2)
+        dx = torch.maximum(left_top[..., 0] - kp_xy[..., 0], kp_xy[..., 0] - right_bottom[..., 0]).clamp(min=0.0)
+        dy = torch.maximum(left_top[..., 1] - kp_xy[..., 1], kp_xy[..., 1] - right_bottom[..., 1]).clamp(min=0.0)
+        obj_size = object_boxes[..., 2:].clamp(min=self.eps).unsqueeze(-2)
+        obj_diag = torch.sqrt(obj_size[..., 0].square() + obj_size[..., 1].square() + self.eps)
+        dist = torch.sqrt(dx.square() + dy.square() + self.eps).unsqueeze(-1) / obj_diag.unsqueeze(-1)
+        inside = ((dx + dy) <= self.eps).to(keypoints.dtype).unsqueeze(-1)
+        return torch.cat([dist, inside, kp_conf], dim=-1).flatten(-2)
+
+    def _build_scene_features(self, human_boxes, object_boxes, token_outputs):
+        union_xyxy = self._union_xyxy(human_boxes, object_boxes)
+        union_cx = (union_xyxy[..., 0] + union_xyxy[..., 2]) * 0.5
+        union_cy = (union_xyxy[..., 1] + union_xyxy[..., 3]) * 0.5
+        union_w = (union_xyxy[..., 2] - union_xyxy[..., 0]).clamp(min=self.eps)
+        union_h = (union_xyxy[..., 3] - union_xyxy[..., 1]).clamp(min=self.eps)
+        union_geom = torch.stack([union_cx, union_cy, union_w, union_h], dim=-1)
+
+        if token_outputs is None:
+            scene_context = union_geom.new_zeros(*union_geom.shape[:-1], self.scene_encoder.layers[0].in_features - 4)
+        else:
+            token_outputs = token_outputs.to(device=union_geom.device, dtype=union_geom.dtype)
+            scene_context = token_outputs[:, :2].mean(dim=1)
+            scene_context = scene_context.unsqueeze(0).unsqueeze(2).expand(*union_geom.shape[:-1], -1)
+        return torch.cat([scene_context, union_geom], dim=-1)
+
+    @staticmethod
+    def _box_cxcywh_to_xyxy(boxes):
+        x_c, y_c, w, h = boxes.unbind(-1)
+        return torch.stack(
+            [x_c - 0.5 * w, y_c - 0.5 * h, x_c + 0.5 * w, y_c + 0.5 * h],
+            dim=-1,
+        )
+
+    def _union_xyxy(self, human_boxes, object_boxes):
+        human_xyxy = self._box_cxcywh_to_xyxy(human_boxes.clamp(0.0, 1.0))
+        object_xyxy = self._box_cxcywh_to_xyxy(object_boxes.clamp(0.0, 1.0))
+        lt = torch.minimum(human_xyxy[..., :2], object_xyxy[..., :2])
+        rb = torch.maximum(human_xyxy[..., 2:], object_xyxy[..., 2:])
+        return torch.cat([lt, rb], dim=-1).clamp(0.0, 1.0)
+
+
+class MACSemanticCalibrator(nn.Module):
+    """Masked semantic recovery and consistency-guided text calibration."""
+
+    def __init__(
+        self,
+        feature_dim,
+        num_slots=4,
+        num_heads=8,
+        dim_feedforward=4096,
+        dropout=0.1,
+        temperature=1.0,
+        init_scale=0.05,
+    ):
+        super().__init__()
+        self.num_slots = int(num_slots)
+        self.temperature = max(float(temperature), 1e-6)
+        self.scale = float(feature_dim) ** -0.5
+
+        self.cross_attn = nn.MultiheadAttention(feature_dim, num_heads, dropout=dropout, batch_first=True)
+        self.recovery_delta = nn.Sequential(
+            nn.Linear(feature_dim * 3, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, feature_dim),
+            nn.LayerNorm(feature_dim),
+        )
+        self.slot_decoder = nn.Sequential(
+            nn.Linear(feature_dim * 3, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, self.num_slots * feature_dim),
+        )
+        self.calibration_delta = nn.Sequential(
+            nn.Linear(feature_dim * 3, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, feature_dim),
+            nn.LayerNorm(feature_dim),
+        )
+        self.enh_visual_gate = nn.Linear(feature_dim * 3, feature_dim)
+        self.cal_visual_gate = nn.Linear(feature_dim * 4, feature_dim)
+        self.enh_text_gate = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.cal_text_gate = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.recovery_scale = nn.Parameter(torch.tensor(float(init_scale)))
+        self.calibration_scale = nn.Parameter(torch.tensor(float(init_scale)))
+
+    def forward(
+        self,
+        pair_feature,
+        base_text_embedding,
+        masked_text_embedding,
+        semantic_prior_embedding,
+        visual_evidence,
+        logit_scale,
+        compute_losses=True,
+    ):
+        feature_shape = pair_feature.shape
+        flat_pair = F.normalize(pair_feature.reshape(-1, feature_shape[-1]), dim=-1)
+        base_text = F.normalize(
+            base_text_embedding.to(device=pair_feature.device, dtype=pair_feature.dtype), dim=-1
+        )
+        masked_text = F.normalize(
             masked_text_embedding.to(device=pair_feature.device, dtype=pair_feature.dtype), dim=-1
         )
-        if raw_text_embedding.shape != masked_text_embedding.shape:
+        prior = self._prepare_prior(
+            semantic_prior_embedding, masked_text, pair_feature.device, pair_feature.dtype
+        )
+        if base_text.shape != masked_text.shape:
             raise ValueError(
-                f"HOI masked prompt bank dim mismatch: raw={raw_text_embedding.shape}, "
-                f"masked={masked_text_embedding.shape}"
+                f"MAC-HOI masked prompt bank dim mismatch: base={base_text.shape}, masked={masked_text.shape}"
             )
-        if pair_feature.shape[-1] != raw_text_embedding.shape[-1]:
+        if base_text.shape[-1] != flat_pair.shape[-1]:
             raise ValueError(
-                f"HOI semantic feature dim mismatch: pair_feature={pair_feature.shape}, "
-                f"text_embedding={raw_text_embedding.shape}"
+                f"MAC-HOI feature dim mismatch: pair_feature={pair_feature.shape}, base_text={base_text.shape}"
             )
 
-        pair_feature = F.normalize(pair_feature, dim=-1)
-        raw_context = self._prompt_context(pair_feature, raw_text_embedding)
-        masked_context = self._prompt_context(pair_feature, masked_text_embedding)
+        evidence = self._flatten_evidence(visual_evidence, pair_feature, flat_pair)
+        class_attn = torch.softmax(torch.matmul(flat_pair, base_text.t()) / self.temperature, dim=-1)
+        prior_context = torch.einsum("nc,csd->nsd", class_attn, prior)
+        masked_context = torch.matmul(class_attn, masked_text).unsqueeze(1)
+        attn_kv = torch.cat([prior_context, masked_context, evidence["context"].unsqueeze(1)], dim=1)
+        recovered = self.cross_attn(flat_pair.unsqueeze(1), attn_kv, attn_kv, need_weights=False)[0].squeeze(1)
 
-        h_raw = self.raw_norm(pair_feature + self.raw_prompt_proj(raw_context))
-        h_ref = self.ref_norm(pair_feature + self.masked_recover(torch.cat([pair_feature, masked_context], dim=-1)))
-        h_raw = F.normalize(h_raw, dim=-1)
-        h_ref = F.normalize(h_ref, dim=-1)
+        recovery_input = torch.cat([flat_pair, recovered, evidence["context"]], dim=-1)
+        recovery_delta = self.recovery_delta(recovery_input) * self.recovery_scale
+        enh_gate = self._class_gate(self.enh_visual_gate(recovery_input), base_text, self.enh_text_gate)
+        enhanced_logits = self._score_with_text_delta(flat_pair, base_text, recovery_delta, enh_gate, logit_scale)
 
-        loss_sem = (1.0 - F.cosine_similarity(h_raw, h_ref, dim=-1)).mean()
-        ref_logits = logit_scale * torch.matmul(h_ref, raw_text_embedding.t())
-        return ref_logits, loss_sem
+        cue_delta = self.calibration_delta(
+            torch.cat([evidence["relation"], evidence["pose"], evidence["scene"]], dim=-1)
+        ) * self.calibration_scale
+        total_delta = recovery_delta + cue_delta
+        cal_input = torch.cat([flat_pair, evidence["context"], recovered, total_delta], dim=-1)
+        cal_gate = self._class_gate(self.cal_visual_gate(cal_input), base_text, self.cal_text_gate)
+        calibrated_logits = self._score_with_text_delta(flat_pair, base_text, total_delta, cal_gate, logit_scale)
+        context_logits = self._score_with_text_delta(evidence["context"], base_text, total_delta, cal_gate, logit_scale)
+
+        outputs = {
+            "calibrated_logits": calibrated_logits.view(*feature_shape[:-1], -1),
+            "enhanced_logits": enhanced_logits.view(*feature_shape[:-1], -1),
+            "context_logits": context_logits.view(*feature_shape[:-1], -1),
+        }
+        losses = {}
+        if compute_losses:
+            slot_pred = self.slot_decoder(recovery_input).view(-1, self.num_slots, feature_shape[-1])
+            slot_target = prior_context[:, : self.num_slots]
+            losses["loss_mask_recovery"] = (
+                1.0 - F.cosine_similarity(slot_pred, slot_target.detach(), dim=-1)
+            ).mean()
+            losses["loss_global_proto_consistency"] = self._prototype_consistency_loss(
+                base_text, total_delta, cal_gate
+            )
+        return outputs, losses
+
+    def _prepare_prior(self, semantic_prior_embedding, masked_text, device, dtype):
+        if semantic_prior_embedding is None:
+            return masked_text.unsqueeze(1).expand(-1, self.num_slots, -1)
+        prior = semantic_prior_embedding.to(device=device, dtype=dtype)
+        if prior.dim() == 2:
+            prior = prior.unsqueeze(1)
+        if prior.shape[1] < self.num_slots:
+            pad = prior[:, -1:].expand(-1, self.num_slots - prior.shape[1], -1)
+            prior = torch.cat([prior, pad], dim=1)
+        return F.normalize(prior[:, : self.num_slots], dim=-1)
+
+    def _flatten_evidence(self, visual_evidence, pair_feature, flat_pair):
+        if visual_evidence is None:
+            zero = torch.zeros_like(flat_pair)
+            return {"relation": zero, "pose": zero, "scene": zero, "context": flat_pair}
+        evidence = {}
+        for key in ["relation", "pose", "scene", "context"]:
+            value = visual_evidence.get(key)
+            if value is None:
+                value = torch.zeros_like(pair_feature) if key != "context" else pair_feature
+            evidence[key] = F.normalize(value.reshape(-1, pair_feature.shape[-1]), dim=-1)
+        return evidence
+
+    def _class_gate(self, visual_gate_feature, base_text, text_gate):
+        text_feature = text_gate(base_text)
+        return torch.sigmoid(torch.matmul(visual_gate_feature, text_feature.t()) * self.scale)
+
+    def _score_with_text_delta(self, visual, base_text, delta, gate, logit_scale):
+        visual = F.normalize(visual, dim=-1)
+        base_text = F.normalize(base_text, dim=-1)
+        base_logits = torch.matmul(visual, base_text.t())
+        visual_delta = (visual * delta).sum(dim=-1, keepdim=True)
+        base_delta = torch.matmul(delta, base_text.t())
+        delta_norm_sq = delta.square().sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        text_norm = torch.sqrt((1.0 + 2.0 * gate * base_delta + gate.square() * delta_norm_sq).clamp(min=1e-6))
+        return logit_scale * (base_logits + gate * visual_delta) / text_norm
+
+    def _prototype_consistency_loss(self, base_text, delta, gate):
+        if delta.numel() == 0:
+            return base_text.sum() * 0.0
+        avg_delta = delta.mean(dim=0, keepdim=True)
+        avg_gate = gate.mean(dim=0).unsqueeze(-1)
+        calibrated_text = F.normalize(base_text + avg_gate * avg_delta, dim=-1)
+        base_sim = torch.matmul(base_text, base_text.t())
+        calibrated_sim = torch.matmul(calibrated_text, calibrated_text.t())
+        return F.mse_loss(calibrated_sim, base_sim)
 
 
 class PoseSpatialInteractionEncoder(nn.Module):
@@ -551,20 +868,62 @@ class HOIDetector(nn.Module):
                 classifier_eval_weights.get("hoi_embedding_eval", masked_train_embedding),
             )
             self.register_buffer("hoi_masked_embedding_eval", masked_eval_embedding.float())
-            self.semantic_enhancer = HOISemanticWordMaskEnhancer(
+            prior_train_embedding = classifier_train_weights.get(
+                "hoi_semantic_prior_train",
+                classifier_train_weights.get("hoi_masked_slot_embedding_train", None),
+            )
+            if prior_train_embedding is None:
+                prior_train_embedding = masked_train_embedding.float().unsqueeze(1).expand(-1, 4, -1).clone()
+            prior_eval_embedding = classifier_eval_weights.get(
+                "hoi_semantic_prior_eval",
+                classifier_eval_weights.get("hoi_masked_slot_embedding_eval", None),
+            )
+            if prior_eval_embedding is None:
+                prior_eval_embedding = masked_eval_embedding.float().unsqueeze(1).expand(-1, 4, -1).clone()
+            self.register_buffer("hoi_semantic_prior_train", prior_train_embedding.float())
+            self.register_buffer("hoi_semantic_prior_eval", prior_eval_embedding.float())
+            self.semantic_calibrator = MACSemanticCalibrator(
                 feature_dim=2 * cfg.MODEL.DINO.EMBED_DIM,
+                num_slots=int(_cfg_get(sem_cfg, "NUM_SLOTS", 4)),
+                num_heads=int(_cfg_get(sem_cfg, "NUM_HEADS", 8)),
                 dim_feedforward=int(_cfg_get(sem_cfg, "DIM_FEEDFORWARD", 4096)),
                 dropout=float(_cfg_get(sem_cfg, "DROPOUT", 0.1)),
                 temperature=float(_cfg_get(sem_cfg, "TEMPERATURE", 1.0)),
+                init_scale=float(_cfg_get(sem_cfg, "INIT_SCALE", 0.05)),
             )
         else:
-            self.semantic_enhancer = None
+            self.semantic_calibrator = None
+
+        rps_cfg = _cfg_get(
+            cfg.MODEL,
+            "RELATION_POSE_SCENE_ADAPTER",
+            _cfg_get(cfg.MODEL, "POSE_SPATIAL_INTERACTION", {}),
+        )
+        self.use_rps_adapter = _cfg_bool(rps_cfg, "ENABLED", False)
+        self.rps_detach_boxes = _cfg_bool(rps_cfg, "DETACH_BOXES", True)
+        self.rps_num_keypoints = int(_cfg_get(rps_cfg, "NUM_KEYPOINTS", 17))
+        if self.use_rps_adapter:
+            self.rps_adapter = RelationPoseSceneAdapter(
+                feature_dim=2 * cfg.MODEL.DINO.EMBED_DIM,
+                scene_dim=dino_embed_dim,
+                num_keypoints=self.rps_num_keypoints,
+                dim_feedforward=int(_cfg_get(rps_cfg, "DIM_FEEDFORWARD", 4096)),
+                dropout=float(_cfg_get(rps_cfg, "DROPOUT", 0.1)),
+                init_scale=float(_cfg_get(rps_cfg, "INIT_SCALE", 0.1)),
+            )
+        else:
+            self.rps_adapter = None
+        self.pose_spatial_num_keypoints = self.rps_num_keypoints
+        self.pose_spatial_encoder = None
 
         ps_cfg = _cfg_get(cfg.MODEL, "POSE_SPATIAL_INTERACTION", {})
         self.use_pose_spatial_interaction = _cfg_bool(ps_cfg, "ENABLED", False)
-        self.pose_spatial_detach_boxes = _cfg_bool(ps_cfg, "DETACH_BOXES", True)
-        self.pose_spatial_num_keypoints = int(_cfg_get(ps_cfg, "NUM_KEYPOINTS", 6))
-        if self.use_pose_spatial_interaction:
+        if self.use_pose_spatial_interaction and self.rps_adapter is None:
+            warnings.warn(
+                "MODEL.POSE_SPATIAL_INTERACTION is deprecated; use "
+                "MODEL.RELATION_POSE_SCENE_ADAPTER for MAC-HOI.",
+                RuntimeWarning,
+            )
             self.pose_spatial_encoder = PoseSpatialInteractionEncoder(
                 hidden_dim=hidden_dim,
                 dino_embed_dim=dino_embed_dim,
@@ -572,8 +931,9 @@ class HOIDetector(nn.Module):
                 dropout=float(_cfg_get(ps_cfg, "DROPOUT", 0.1)),
                 init_scale=float(_cfg_get(ps_cfg, "INIT_SCALE", 0.1)),
             )
+            self.pose_spatial_detach_boxes = _cfg_bool(ps_cfg, "DETACH_BOXES", True)
         else:
-            self.pose_spatial_encoder = None
+            self.pose_spatial_detach_boxes = True
 
         vitpose_cfg = _cfg_get(cfg.MODEL, "VITPOSE", {})
         self.use_vitpose = _cfg_bool(vitpose_cfg, "ENABLED", False)
@@ -693,13 +1053,15 @@ class HOIDetector(nn.Module):
         outputs_sub_coord = self.hum_bbox_embed(h_hs).sigmoid()
         outputs_obj_coord = self.obj_bbox_embed(o_hs).sigmoid()
 
+        needs_pose_keypoints = self.pose_spatial_encoder is not None or self.rps_adapter is not None
+        if pose_keypoints is None and self.vitpose_estimator is not None and needs_pose_keypoints:
+            pose_keypoints = self.vitpose_estimator(samples, outputs_sub_coord.detach())
+
         pose_spatial_hidden = None
         pose_spatial_dino = None
         if self.pose_spatial_encoder is not None:
             ps_sub_boxes = outputs_sub_coord.detach() if self.pose_spatial_detach_boxes else outputs_sub_coord
             ps_obj_boxes = outputs_obj_coord.detach() if self.pose_spatial_detach_boxes else outputs_obj_coord
-            if pose_keypoints is None and self.vitpose_estimator is not None:
-                pose_keypoints = self.vitpose_estimator(samples, ps_sub_boxes.detach())
             pose_spatial_hidden, pose_spatial_dino = self.pose_spatial_encoder(
                 ps_sub_boxes, ps_obj_boxes, pose_keypoints
             )
@@ -746,34 +1108,60 @@ class HOIDetector(nn.Module):
             logit_scale = self.logit_scale.exp()
             inter_hs = self.hoi_class_fc(inter_hs)
             inter_hs = inter_hs / inter_hs.norm(dim=-1, keepdim=True)
+            visual_evidence = None
+            if self.rps_adapter is not None:
+                rps_sub_boxes = outputs_sub_coord.detach() if self.rps_detach_boxes else outputs_sub_coord
+                rps_obj_boxes = outputs_obj_coord.detach() if self.rps_detach_boxes else outputs_obj_coord
+                visual_evidence = self.rps_adapter(
+                    inter_hs,
+                    rps_sub_boxes,
+                    rps_obj_boxes,
+                    token_outputs=token_outputs,
+                    pose_keypoints=pose_keypoints,
+                )
             use_eval_hoi_bank = (
                 self.cfg.INPUT.DATASET_FILE == "hico"
                 and self.cfg.ZERO_SHOT.TYPE != "default"
                 and (self.cfg.RUNTIME.EVAL or not self.training)
             )
             if use_eval_hoi_bank:
+                base_hoi_embedding = self.eval_visual_projection.weight
                 outputs_hoi_class = logit_scale * self.eval_visual_projection(inter_hs)
+                masked_hoi_embedding = self.hoi_masked_embedding_eval if self.semantic_calibrator is not None else None
+                semantic_prior_embedding = self.hoi_semantic_prior_eval if self.semantic_calibrator is not None else None
             else:
+                base_hoi_embedding = self.visual_projection.weight
                 outputs_hoi_class = logit_scale * self.visual_projection(inter_hs)
+                masked_hoi_embedding = self.hoi_masked_embedding_train if self.semantic_calibrator is not None else None
+                semantic_prior_embedding = self.hoi_semantic_prior_train if self.semantic_calibrator is not None else None
+
+            semantic_losses = {}
+            outputs_hoi_masked_class = None
+            outputs_ctx_hoi_class = None
+            if self.semantic_calibrator is not None:
+                calibrated_outputs, semantic_losses = self.semantic_calibrator(
+                    inter_hs,
+                    base_hoi_embedding,
+                    masked_hoi_embedding,
+                    semantic_prior_embedding,
+                    visual_evidence,
+                    logit_scale,
+                    compute_losses=self.training,
+                )
+                outputs_hoi_class = calibrated_outputs["calibrated_logits"]
+                outputs_hoi_masked_class = calibrated_outputs["enhanced_logits"]
+                outputs_ctx_hoi_class = calibrated_outputs["context_logits"]
         else:
             raise ValueError("Please use DINO.txt label for HOI classification!")
 
-        semantic_consistency_loss = None
-        outputs_hoi_masked_class = None
-        if self.semantic_enhancer is not None and self.training:
-            outputs_hoi_masked_class, semantic_consistency_loss = self.semantic_enhancer(
-                inter_hs,
-                self.visual_projection.weight,
-                self.hoi_masked_embedding_train,
-                logit_scale,
-            )
-
         out = {'pred_hoi_logits': outputs_hoi_class[-1], 'pred_obj_logits': outputs_obj_class[-1],
                'pred_sub_boxes': outputs_sub_coord[-1], 'pred_obj_boxes': outputs_obj_coord[-1]}
-        if semantic_consistency_loss is not None:
-            out['loss_semantic_consistency'] = semantic_consistency_loss
+        for loss_name, loss_value in semantic_losses.items():
+            out[loss_name] = loss_value
         if outputs_hoi_masked_class is not None:
             out['pred_hoi_masked_logits'] = outputs_hoi_masked_class[-1]
+        if outputs_ctx_hoi_class is not None:
+            out['pred_ctx_hoi_logits'] = outputs_ctx_hoi_class[-1]
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss_triplet(outputs_hoi_class, outputs_obj_class,
@@ -850,12 +1238,20 @@ def build_detector(cfg, is_fresh_train: bool = True):
     if _cfg_bool(clip_soft_cfg, "ENABLED") and clip_soft_weight > 0:
         weight_dict["loss_hoi_clip_soft"] = clip_soft_weight
     sem_cfg = _cfg_get(cfg.MODEL, "SEMANTIC_ENHANCEMENT", {})
-    sem_weight = float(_cfg_get(sem_cfg, "CONSISTENCY_WEIGHT", 0.0))
-    if _cfg_bool(sem_cfg, "ENABLED") and sem_weight > 0:
-        weight_dict["loss_semantic_consistency"] = sem_weight
     sem_masked_weight = float(_cfg_get(sem_cfg, "MASKED_LOSS_WEIGHT", 0.0))
     if _cfg_bool(sem_cfg, "ENABLED") and sem_masked_weight > 0:
         weight_dict["loss_hoi_masked_semantic"] = sem_masked_weight
+    sem_mask_recovery_weight = float(_cfg_get(sem_cfg, "MASK_RECOVERY_WEIGHT", 0.0))
+    if _cfg_bool(sem_cfg, "ENABLED") and sem_mask_recovery_weight > 0:
+        weight_dict["loss_mask_recovery"] = sem_mask_recovery_weight
+    sem_vt_weight = float(
+        _cfg_get(sem_cfg, "VT_CONSISTENCY_WEIGHT", _cfg_get(sem_cfg, "CONSISTENCY_WEIGHT", 0.0))
+    )
+    if _cfg_bool(sem_cfg, "ENABLED") and sem_vt_weight > 0:
+        weight_dict["loss_visual_text_consistency"] = sem_vt_weight
+    sem_proto_weight = float(_cfg_get(sem_cfg, "PROTO_CONSISTENCY_WEIGHT", 0.0))
+    if _cfg_bool(sem_cfg, "ENABLED") and sem_proto_weight > 0:
+        weight_dict["loss_global_proto_consistency"] = sem_proto_weight
 
     if cfg.MODEL.HOI.DEEP_SUPERVISION:
         num_dec_layers = model.num_dec_layers

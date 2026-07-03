@@ -81,33 +81,70 @@ def _mask_object_phrase(object_phrase: str, mask_token: str) -> str:
     return mask_token
 
 
+def _split_hico_phrase(text: str, object_phrase: str) -> Tuple[str, str]:
+    clean_text = _clean_prompt(_strip_photo_prefix(text))
+    object_phrase = _clean_prompt(_strip_photo_prefix(object_phrase or "object"))
+    person_pos = clean_text.find("person")
+    object_pos = clean_text.rfind(object_phrase) if object_phrase else -1
+    if person_pos < 0 or object_pos < 0 or object_pos <= person_pos:
+        return clean_text.replace("person", "", 1).strip() or clean_text, object_phrase
+    relation_phrase = clean_text[person_pos + len("person"):object_pos].strip()
+    return relation_phrase or "interact with", object_phrase
+
+
+def build_hico_semantic_slot_prompts(
+    hoi_text_label: Dict[Any, str],
+    obj_text_label: list,
+    mask_token: str = "<MASK>",
+) -> Tuple[List[List[str]], List[List[str]]]:
+    obj_text_lookup = {idx: text for idx, text in obj_text_label}
+    masked_slots, prior_slots = [], []
+    for hoi_key, text in hoi_text_label.items():
+        obj_id = hoi_key[1] if isinstance(hoi_key, tuple) and len(hoi_key) > 1 else None
+        relation_phrase, object_phrase = _split_hico_phrase(text, obj_text_lookup.get(obj_id, "object"))
+        full_prompt = _clean_prompt(_strip_photo_prefix(text))
+        masked_object = _mask_object_phrase(object_phrase, mask_token)
+
+        masked_slots.append([
+            _clean_prompt(f"person {mask_token} {object_phrase}"),
+            _clean_prompt(f"person {relation_phrase} {masked_object}"),
+            _clean_prompt(f"person with {mask_token} {relation_phrase} {object_phrase}"),
+            _clean_prompt(f"person {relation_phrase} {object_phrase} in {mask_token}"),
+        ])
+        prior_slots.append([
+            _clean_prompt(f"spatial relation evidence for {full_prompt}: person {relation_phrase} {object_phrase}"),
+            _clean_prompt(f"object evidence for {full_prompt}: {object_phrase}"),
+            _clean_prompt(f"human pose evidence for {full_prompt}: pose while {relation_phrase} {object_phrase}"),
+            _clean_prompt(f"scene context evidence for {full_prompt}"),
+        ])
+    return masked_slots, prior_slots
+
+
 def build_hico_masked_prompt_variants(
     hoi_text_label: Dict[Any, str],
     obj_text_label: list,
     mask_token: str = "<MASK>",
 ) -> List[List[str]]:
-    obj_text_lookup = {idx: text for idx, text in obj_text_label}
-    variants = []
-    for hoi_key, text in hoi_text_label.items():
-        obj_id = hoi_key[1] if isinstance(hoi_key, tuple) and len(hoi_key) > 1 else None
-        object_phrase = _strip_photo_prefix(obj_text_lookup.get(obj_id, ""))
-        person_pos = text.find("person")
-        object_pos = text.rfind(object_phrase) if object_phrase else -1
+    masked_slots, _ = build_hico_semantic_slot_prompts(hoi_text_label, obj_text_label, mask_token=mask_token)
+    return masked_slots
 
-        if person_pos < 0 or object_pos < 0 or object_pos <= person_pos:
-            variants.append([_clean_prompt(text.replace("person", mask_token, 1))])
-            continue
 
-        head = text[:person_pos]
-        between = text[person_pos + len("person"):object_pos]
-        masked_object = _mask_object_phrase(object_phrase, mask_token)
-
-        variants.append([
-            _clean_prompt(f"{head}person {mask_token} {object_phrase}"),
-            _clean_prompt(f"{head}person{between}{masked_object}"),
-            _clean_prompt(f"{head}{mask_token}{between}{object_phrase}"),
-        ])
-    return variants
+def encode_slot_prompt_embeddings(
+    slot_prompts: List[List[str]],
+    model: torch.nn.Module,
+    tokenizer: Any,
+    device: str,
+    batch_size: int = 64,
+) -> torch.Tensor:
+    slot_counts = {len(item) for item in slot_prompts}
+    if len(slot_counts) != 1:
+        raise ValueError(f"All HOI semantic slot prompt groups must have the same length, got {slot_counts}")
+    num_slots = slot_counts.pop()
+    flat_texts = [text for item in slot_prompts for text in item]
+    flat_embeddings = encode_texts(
+        flat_texts, model=model, tokenizer=tokenizer, device=device, batch_size=batch_size
+    )
+    return flat_embeddings.view(len(slot_prompts), num_slots, -1)
 
 
 def encode_texts(
@@ -161,7 +198,19 @@ def init_classifier_with_dino(
     tokenizer: Any,
     device: str,
     batch_size: int = 64,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[Any, str], torch.Tensor]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Dict[Any, str],
+    torch.Tensor,
+]:
     """
     Initialize classifier text embeddings for HOI and object labels using DINOv3 text encoder.
 
@@ -182,6 +231,10 @@ def init_classifier_with_dino(
             - obj_text_embedding_eval (torch.Tensor): Object text embeddings for evaluation. Shape [K_obj, D].
             - hoi_masked_embedding_train (torch.Tensor): Masked HOI text embeddings for training. Shape [K_train, D].
             - hoi_masked_embedding_eval (torch.Tensor): Masked HOI text embeddings for evaluation. Shape [K_eval, D].
+            - hoi_masked_slot_embedding_train (torch.Tensor): Masked slot embeddings [K_train, 4, D].
+            - hoi_masked_slot_embedding_eval (torch.Tensor): Masked slot embeddings [K_eval, 4, D].
+            - hoi_semantic_prior_train (torch.Tensor): Semantic prior bank [K_train, 4, D].
+            - hoi_semantic_prior_eval (torch.Tensor): Semantic prior bank [K_eval, 4, D].
             - hoi_text_label_train (Dict[Any, str]): Filtered HOI label dict for training.
             - obj_text_inputs (torch.Tensor): Tokenized object label texts. Shape [K_obj, L].
     """
@@ -205,8 +258,10 @@ def init_classifier_with_dino(
     # Tokenize object label texts
     obj_text_inputs = torch.cat([tokenizer.tokenize(obj_text[1]) for obj_text in obj_text_label])
 
-    hoi_masked_variants_eval = build_hico_masked_prompt_variants(hoi_text_label, obj_text_label)
-    hoi_masked_variants_train = build_hico_masked_prompt_variants(hoi_text_label_train, obj_text_label)
+    hoi_masked_slots_eval, hoi_prior_slots_eval = build_hico_semantic_slot_prompts(hoi_text_label, obj_text_label)
+    hoi_masked_slots_train, hoi_prior_slots_train = build_hico_semantic_slot_prompts(
+        hoi_text_label_train, obj_text_label
+    )
 
     # Encode text embeddings with DINOv3 in batches.
     hoi_embedding_eval = encode_texts(eval_texts, model=model, tokenizer=tokenizer, device=device, batch_size=batch_size)
@@ -215,12 +270,20 @@ def init_classifier_with_dino(
     obj_text_embedding_eval = encode_texts(
         obj_texts, model=model, tokenizer=tokenizer, device=device, batch_size=batch_size
     )
-    hoi_masked_embedding_train = encode_masked_prompt_embeddings(
-        hoi_masked_variants_train, model=model, tokenizer=tokenizer, device=device, batch_size=batch_size
+    hoi_masked_slot_embedding_train = encode_slot_prompt_embeddings(
+        hoi_masked_slots_train, model=model, tokenizer=tokenizer, device=device, batch_size=batch_size
     )
-    hoi_masked_embedding_eval = encode_masked_prompt_embeddings(
-        hoi_masked_variants_eval, model=model, tokenizer=tokenizer, device=device, batch_size=batch_size
+    hoi_masked_slot_embedding_eval = encode_slot_prompt_embeddings(
+        hoi_masked_slots_eval, model=model, tokenizer=tokenizer, device=device, batch_size=batch_size
     )
+    hoi_semantic_prior_train = encode_slot_prompt_embeddings(
+        hoi_prior_slots_train, model=model, tokenizer=tokenizer, device=device, batch_size=batch_size
+    )
+    hoi_semantic_prior_eval = encode_slot_prompt_embeddings(
+        hoi_prior_slots_eval, model=model, tokenizer=tokenizer, device=device, batch_size=batch_size
+    )
+    hoi_masked_embedding_train = F.normalize(hoi_masked_slot_embedding_train.mean(dim=1), p=2, dim=-1)
+    hoi_masked_embedding_eval = F.normalize(hoi_masked_slot_embedding_eval.mean(dim=1), p=2, dim=-1)
 
     return (
         hoi_embedding_train,
@@ -228,6 +291,10 @@ def init_classifier_with_dino(
         obj_text_embedding_eval,
         hoi_masked_embedding_train,
         hoi_masked_embedding_eval,
+        hoi_masked_slot_embedding_train,
+        hoi_masked_slot_embedding_eval,
+        hoi_semantic_prior_train,
+        hoi_semantic_prior_eval,
         hoi_text_label_train,
         obj_text_inputs,
     )
@@ -236,6 +303,8 @@ def save_classifier_eval(
     hoi_embedding_eval: torch.Tensor,
     obj_text_embedding_eval: torch.Tensor,
     hoi_masked_embedding_eval: torch.Tensor,
+    hoi_masked_slot_embedding_eval: torch.Tensor,
+    hoi_semantic_prior_eval: torch.Tensor,
     save_path: Path
 ) -> None:
     """
@@ -245,12 +314,16 @@ def save_classifier_eval(
         hoi_embedding_eval (torch.Tensor): HOI text embeddings [K_eval, D].
         obj_text_embedding_eval (torch.Tensor): Object text embeddings [K_obj, D].
         hoi_masked_embedding_eval (torch.Tensor): Masked HOI text embeddings [K_eval, D].
+        hoi_masked_slot_embedding_eval (torch.Tensor): Masked slot embeddings [K_eval, 4, D].
+        hoi_semantic_prior_eval (torch.Tensor): Semantic prior bank [K_eval, 4, D].
         save_path (Path): Output .pt file path.
     """
     torch.save(
         {
             "hoi_embedding_eval": hoi_embedding_eval.cpu(),
             "hoi_embedding_masked_eval": hoi_masked_embedding_eval.cpu(),
+            "hoi_masked_slot_embedding_eval": hoi_masked_slot_embedding_eval.cpu(),
+            "hoi_semantic_prior_eval": hoi_semantic_prior_eval.cpu(),
             "obj_text_embedding_eval": obj_text_embedding_eval.cpu()
         },
         str(save_path)
@@ -259,6 +332,8 @@ def save_classifier_eval(
 def save_classifier_train(
     hoi_embedding_train: torch.Tensor,
     hoi_masked_embedding_train: torch.Tensor,
+    hoi_masked_slot_embedding_train: torch.Tensor,
+    hoi_semantic_prior_train: torch.Tensor,
     save_path: Path
 ) -> None:
     """
@@ -267,12 +342,16 @@ def save_classifier_train(
     Args:
         hoi_embedding_train (torch.Tensor): HOI text embeddings for training [K_train, D].
         hoi_masked_embedding_train (torch.Tensor): Masked HOI text embeddings for training [K_train, D].
+        hoi_masked_slot_embedding_train (torch.Tensor): Masked slot embeddings [K_train, 4, D].
+        hoi_semantic_prior_train (torch.Tensor): Semantic prior bank [K_train, 4, D].
         save_path (Path): Output .pt file path.
     """
     torch.save(
         {
             "hoi_embedding_train": hoi_embedding_train.cpu(),
-            "hoi_embedding_masked_train": hoi_masked_embedding_train.cpu()
+            "hoi_embedding_masked_train": hoi_masked_embedding_train.cpu(),
+            "hoi_masked_slot_embedding_train": hoi_masked_slot_embedding_train.cpu(),
+            "hoi_semantic_prior_train": hoi_semantic_prior_train.cpu()
         },
         str(save_path)
     )
@@ -299,7 +378,19 @@ def main() -> None:
     unseen_index = hico_unseen_index
 
     # Compute eval embeddings (these do not depend on del_unseen or zero_shot_type)
-    _, hoi_embedding_eval, obj_text_embedding_eval, _, hoi_masked_embedding_eval, _, _ = init_classifier_with_dino(
+    (
+        _,
+        hoi_embedding_eval,
+        obj_text_embedding_eval,
+        _,
+        hoi_masked_embedding_eval,
+        _,
+        hoi_masked_slot_embedding_eval,
+        _,
+        hoi_semantic_prior_eval,
+        _,
+        _,
+    ) = init_classifier_with_dino(
         del_unseen=False,
         zero_shot_type="default",
         hoi_text_label=hoi_text_label,
@@ -313,7 +404,14 @@ def main() -> None:
 
     # Save eval embeddings (HOI + object) in a single file
     eval_path = save_dir / "classifier_eval.pt"
-    save_classifier_eval(hoi_embedding_eval, obj_text_embedding_eval, hoi_masked_embedding_eval, eval_path)
+    save_classifier_eval(
+        hoi_embedding_eval,
+        obj_text_embedding_eval,
+        hoi_masked_embedding_eval,
+        hoi_masked_slot_embedding_eval,
+        hoi_semantic_prior_eval,
+        eval_path,
+    )
     print(f"Saved eval classifier embeddings to {eval_path}")
 
     # Define zero-shot splits; you can add or modify splits as needed
@@ -328,7 +426,19 @@ def main() -> None:
     # For each split, save its classifier train embedding
     for zero_shot_type, del_unseen in zero_shot_splits:
         print(f"Processing train split: zero_shot_type={zero_shot_type}, del_unseen={del_unseen}")
-        hoi_embedding_train, _, _, hoi_masked_embedding_train, _, hoi_text_label_train, _ = init_classifier_with_dino(
+        (
+            hoi_embedding_train,
+            _,
+            _,
+            hoi_masked_embedding_train,
+            _,
+            hoi_masked_slot_embedding_train,
+            _,
+            hoi_semantic_prior_train,
+            _,
+            hoi_text_label_train,
+            _,
+        ) = init_classifier_with_dino(
             del_unseen=del_unseen,
             zero_shot_type=zero_shot_type,
             hoi_text_label=hoi_text_label,
@@ -343,7 +453,13 @@ def main() -> None:
         print(f"  hoi_text_label_train count: {len(hoi_text_label_train)}")
 
         train_path = save_dir / f"classifier_{zero_shot_type}.pt"
-        save_classifier_train(hoi_embedding_train, hoi_masked_embedding_train, train_path)
+        save_classifier_train(
+            hoi_embedding_train,
+            hoi_masked_embedding_train,
+            hoi_masked_slot_embedding_train,
+            hoi_semantic_prior_train,
+            train_path,
+        )
         print(f"Saved train classifier embeddings to {train_path}")
 
 if __name__ == "__main__":
