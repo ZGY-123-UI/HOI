@@ -1,0 +1,90 @@
+SOLVER:
+  EPOCHS: 5
+  LR_DROP_EPOCHS: [3]    # Epoch after which to drop LR
+  SAVE_START_EPOCH: 4
+  SAVE_EVERY_EPOCHS: 1
+LOSS:
+  MATCHER:
+    SET_COST_BBOX: 2.5
+    SET_COST_GIOU: 1.0
+    SET_COST_OBJ_CLASS: 1.0
+    SET_COST_HOI: 2.0
+  COEFFS:
+    BBOX_LOSS_COEF: 2.5
+    GIOU_LOSS_COEF: 1.0
+    OBJ_LOSS_COEF: 1.0
+    HOI_LOSS_COEF: 2.0
+  ALPHA_FOCAL_LOSS_HOI: 0.5
+  ALPHA_FOCAL_LOSS_OBJ: 0.25
+  COEF_CE_LOSS_OBJ: 0.1
+
+MODEL:
+  PIXEL_MEAN: [123.675, 116.280, 103.530]
+  PIXEL_STD: [58.395, 57.120, 57.375]       # for d2 only
+  POSITION_EMBEDDING: "sine"                # Position embedding type (sine, learned)
+  NAME: "SL-HOI"                             # Model name
+  BACKBONE:
+    NAME: "DINOv3"
+    NUM_FEATURE_LEVELS: 1
+  TRANSFORMER:
+    DIM_FEEDFORWARD: 2048
+    NHEADS: 8
+    DROPOUT: 0.1
+    ACTIVATION: "relu"
+    ENC_LAYERS: 2
+    INS_DEC_LAYERS: 3
+    NUM_QUERIES: 64
+  HOI:
+    HIDDEN_DIM: 256
+    DEEP_SUPERVISION: true
+  EARLY_FUSION:
+    ENABLED: false
+    SPATIAL_DIM: 2
+  SEMANTIC_ENHANCEMENT:
+    ENABLED: true
+    CONSISTENCY_WEIGHT: 0.05
+    MASKED_LOSS_WEIGHT: 0.2
+    TEMPERATURE: 1.0
+    REQUIRE_MASKED_EMBEDDING: false
+    DIM_FEEDFORWARD: 4096
+    DROPOUT: 0.1
+  POSE_SPATIAL_INTERACTION:
+    ENABLED: true
+    NUM_KEYPOINTS: 17
+    DROPOUT: 0.1
+    INIT_SCALE: 0.1
+    DETACH_BOXES: true
+  VITPOSE:
+    ENABLED: true
+    CONFIG: ""
+    CHECKPOINT: ""
+    NUM_KEYPOINTS: 17
+    SCORE_THR: 0.05
+    IMAGE_FORMAT: "RGB"
+    PIXEL_MEAN: [0.485, 0.456, 0.406]
+    PIXEL_STD: [0.229, 0.224, 0.225]
+  DINO:
+    WITH_DINO_LABEL: true
+    WITH_OBJ_DINO_LABEL: true
+    DINOTXT_WEIGHTS: ""
+    BACKBONE_WEIGHTS: ""
+    BPE_PATH_OR_URL: ""
+    FREEZE: true
+    EMBED_DIM: 1024
+    LAYERS_TO_USE: []
+    N_WINDOWS_SQRT: 2
+    N_STORAGE_TOKENS: 4
+INPUT: # HICO-Det specific parameters
+  FORMAT: "RGB"
+  NUM_OBJ_CLASSES: 80
+  SUBJECT_CATEGORY_ID: 0
+  DATASET_FILE: "hico"
+  PATH: ""
+ZERO_SHOT:
+  TYPE: "default"       # default, rare_first, non_rare_first, unseen_object, unseen_verb
+  DEL_UNSEEN: false     # false for default, true for all other types
+  CLASSIFIER:
+    TRAIN: ""
+    EVAL: ""
+RUNTIME:
+  NUM_WORKERS: 4

@@ -1,0 +1,61 @@
+# Logs
+logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Experiment outputs
+exps/
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+*.swp
+
+# Model checkpoints
+*.pt
+*.pth
+*.bin
+*.ckpt
+*checkpoint-*
+
+# Build artifacts
+*build
+*-info
+
+# Temporary files
+*.tmp
+*.temp
+
+# Datasets and generated data
+data/
+datasets/
+
+# Model weights and checkpoints
+weights/
+pretrained/
+params/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+
+# Extra experiment outputs
+exps1/
+exps2/
+exps3/
+outputs/
+runs/
+wandb/
+
+# Local temp files
+.gitignore.swp
