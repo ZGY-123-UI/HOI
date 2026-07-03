@@ -647,11 +647,13 @@ class ViTPoseTopDownEstimator(nn.Module):
             return self._model_holder[0]
         try:
             from mmpose.apis import init_model
+            from mmpose.utils import register_all_modules
         except ImportError as exc:
             raise ImportError(
                 "ViTPose integration requires MMPose. Install mmpose/mmcv/mmengine "
                 "and set MODEL.VITPOSE.CONFIG / MODEL.VITPOSE.CHECKPOINT."
             ) from exc
+        register_all_modules(init_default_scope=True)
         model = init_model(self.config, self.checkpoint, device=device)
         model.eval()
         self._model_holder[0] = model

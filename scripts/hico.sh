@@ -20,6 +20,7 @@ MMPOSE_DIR="${PROJECT_DIR}/third_party/mmpose"
 VITPOSE_DIR="${PROJECT_DIR}/weights/vitpose"
 VITPOSE_CONFIG="${MMPOSE_DIR}/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py"
 VITPOSE_CHECKPOINT="${VITPOSE_DIR}/vitpose-b.pth"
+export PYTHONPATH="${MMPOSE_DIR}:${PYTHONPATH}"
 
 CONFIG_FILE="configs/hico.yaml"
 DEFAULT_CONFIG="configs/base.yaml"
