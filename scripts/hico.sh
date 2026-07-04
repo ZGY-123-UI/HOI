@@ -12,28 +12,12 @@ export DS_LOG_LEVEL=WARN
 export ACCELERATE_LOG_LEVEL=WARN
 
 # --------- Directory and Paths ---------
-EXP_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/exps3/hico"
-DATA_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/data/hico_20160224_det/"
-DINO_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/weights/dinov3"
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-if [ -z "${MMPOSE_DIR}" ]; then
-    if [ -d "${PROJECT_DIR}/third_party/mmpose/mmpose/apis" ]; then
-        MMPOSE_DIR="${PROJECT_DIR}/third_party/mmpose"
-    elif [ -d "${PROJECT_DIR}/mmpose/mmpose/apis" ]; then
-        MMPOSE_DIR="${PROJECT_DIR}/mmpose"
-    else
-        MMPOSE_DIR="${PROJECT_DIR}/third_party/mmpose"
-    fi
-fi
-
-if [ -z "${VITPOSE_DIR}" ]; then
-    if [ -d "${PROJECT_DIR}/weights/Vitpose" ]; then
-        VITPOSE_DIR="${PROJECT_DIR}/weights/Vitpose"
-    else
-        VITPOSE_DIR="${PROJECT_DIR}/weights/vitpose"
-    fi
-fi
+PROJECT_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI"
+EXP_DIR="${PROJECT_DIR}/exps3/hico"
+DATA_DIR="${PROJECT_DIR}/data/hico_20160224_det/"
+DINO_DIR="${PROJECT_DIR}/weights/dinov3"
+MMPOSE_DIR="${MMPOSE_DIR:-${PROJECT_DIR}/mmpose}"
+VITPOSE_DIR="${VITPOSE_DIR:-${PROJECT_DIR}/weights/Vitpose}"
 
 DEFAULT_VITPOSE_CONFIG="${MMPOSE_DIR}/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py"
 if [ ! -f "${DEFAULT_VITPOSE_CONFIG}" ] && [ -f "${MMPOSE_DIR}/mmpose/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py" ]; then
@@ -61,7 +45,7 @@ echo "Using ViTPose checkpoint: ${VITPOSE_CHECKPOINT}"
 
 if [ ! -f "${VITPOSE_CONFIG}" ]; then
     echo "Error: ViTPose config not found: ${VITPOSE_CONFIG}"
-    echo "Place the full MMPose repo under third_party/mmpose, not only a single config file."
+    echo "Expected the full MMPose repo at: ${MMPOSE_DIR}"
     exit 1
 fi
 
@@ -91,7 +75,7 @@ if [ $? -ne 0 ]; then
     echo "Fix on the server with one of:"
     echo "  git clone https://github.com/open-mmlab/mmpose.git ${MMPOSE_DIR}"
     echo "  pip install -e ${MMPOSE_DIR}"
-    echo "and make sure mmcv, mmengine, and mmpretrain are installed in the slhoi environment."
+    echo "and make sure mmcv, mmengine, mmpretrain, and mmdet are installed in the slhoi environment."
     exit 1
 fi
 
