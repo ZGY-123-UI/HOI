@@ -1,8 +1,8 @@
 SOLVER:
-  EPOCHS: 5
-  LR_DROP_EPOCHS: [3, 5]    # Epoch after which to drop LR
-  SAVE_START_EPOCH: 4
-  SAVE_EVERY_EPOCHS: 1
+  EPOCHS: 100
+  LR_DROP_EPOCHS: [60, 90]    # Epoch after which to drop LR
+  SAVE_START_EPOCH: 80
+  SAVE_EVERY_EPOCHS: 5
 MODEL:
   PIXEL_MEAN: [123.675, 116.280, 103.530]
   PIXEL_STD: [58.395, 57.120, 57.375]       # for d2 only

@@ -11,28 +11,25 @@ export OMP_NUM_THREADS=2
 export DS_LOG_LEVEL=WARN
 export ACCELERATE_LOG_LEVEL=WARN
 
-DATA_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/data/swig_hoi"
-#CONFIG_FILE="configs/swig.yaml"
-CONFIG_FILE="/media/qdu/2.0T/zgy/projects/SL-HOI/exps/swig/exp_config.yaml"
+DATA_DIR="/path/to/your/datasets/swig_hoi"
+CONFIG_FILE="configs/swig.yaml"
 DEFAULT_CONFIG="configs/base.yaml"
-#CHECKPOINT_PATH="pretrained/swig/pytorch_model.bin"
-CHECKPOINT_PATH="/media/qdu/2.0T/zgy/projects/SL-HOI/exps/swig/checkpoint-epoch-59"
-#EVAL_OUTPUT_DIR="pretrained/swig"
-EVAL_OUTPUT_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/exps/swig/checkpoint-epoch-59/eval"
+CHECKPOINT_PATH="pretrained/swig/pytorch_model.bin"
+EVAL_OUTPUT_DIR="pretrained/swig"
 
 # --------- Evaluation ---------
 accelerate launch \
     --config_file "configs/accelerate_config.yaml" \
-    --num_processes=1 \
+    --num_processes=8 \
     --main_process_port=12888 \
     train.py \
     -c ${CONFIG_FILE} \
     --default-config ${DEFAULT_CONFIG} \
-    SOLVER.BATCH_SIZE=2 \
+    SOLVER.BATCH_SIZE=32 \
     RUNTIME.EVAL=true \
     RUNTIME.PRETRAINED=${CHECKPOINT_PATH} \
     RUNTIME.OUTPUT_DIR=${EVAL_OUTPUT_DIR} \
-    RUNTIME.NUM_WORKERS=0 \
+    RUNTIME.NUM_WORKERS=2 \
     INPUT.PATH="${DATA_DIR}" \
     ZERO_SHOT.CLASSIFIER.EVAL="params/swig/classifier_swig_dict.pt"
 

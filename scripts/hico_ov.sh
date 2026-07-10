@@ -12,84 +12,24 @@ export DS_LOG_LEVEL=WARN
 export ACCELERATE_LOG_LEVEL=WARN
 
 # --------- Directory and Paths ---------
-PROJECT_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI"
-EXP_DIR="${PROJECT_DIR}/exps1/hico_ov"
-DATA_DIR="${PROJECT_DIR}/data/hico_20160224_det/"
-DINO_DIR="${PROJECT_DIR}/weights/dinov3"
-MMPOSE_DIR="${MMPOSE_DIR:-${PROJECT_DIR}/mmpose}"
-VITPOSE_DIR="${VITPOSE_DIR:-${PROJECT_DIR}/weights/Vitpose}"
-
-DEFAULT_VITPOSE_CONFIG="${MMPOSE_DIR}/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py"
-if [ ! -f "${DEFAULT_VITPOSE_CONFIG}" ] && [ -f "${MMPOSE_DIR}/mmpose/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py" ]; then
-    DEFAULT_VITPOSE_CONFIG="${MMPOSE_DIR}/mmpose/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_ViTPose-base_8xb64-210e_coco-256x192.py"
-fi
-VITPOSE_CONFIG="${VITPOSE_CONFIG:-${DEFAULT_VITPOSE_CONFIG}}"
-
-if [ -z "${VITPOSE_CHECKPOINT}" ]; then
-    VITPOSE_CHECKPOINT="${VITPOSE_DIR}/vitpose-b.pth"
-    if [ ! -f "${VITPOSE_CHECKPOINT}" ]; then
-        FOUND_VITPOSE_CHECKPOINT=$(find "${VITPOSE_DIR}" -maxdepth 1 -type f \( -name "*ViTPose-base*.pth" -o -name "*vitpose*b*.pth" -o -name "*.pth" \) 2>/dev/null | head -n 1)
-        if [ -n "${FOUND_VITPOSE_CHECKPOINT}" ]; then
-            VITPOSE_CHECKPOINT="${FOUND_VITPOSE_CHECKPOINT}"
-        fi
-    fi
-fi
-export PYTHONPATH="${MMPOSE_DIR}:${PYTHONPATH}"
+EXP_DIR="exps/hico_ov"
+DATA_DIR="/path/to/your/datasets/hico_20160224_det"
+DINO_DIR="/path/to/your/weights/dinov3"
 
 CONFIG_FILE="configs/hico.yaml"
 DEFAULT_CONFIG="configs/base.yaml"
 
-echo "Using MMPose dir: ${MMPOSE_DIR}"
-echo "Using ViTPose config: ${VITPOSE_CONFIG}"
-echo "Using ViTPose checkpoint: ${VITPOSE_CHECKPOINT}"
-
-if [ ! -f "${VITPOSE_CONFIG}" ]; then
-    echo "Error: ViTPose config not found: ${VITPOSE_CONFIG}"
-    echo "Expected the full MMPose repo at: ${MMPOSE_DIR}"
-    exit 1
-fi
-
-if [ ! -f "${VITPOSE_CHECKPOINT}" ]; then
-    echo "Error: ViTPose checkpoint not found: ${VITPOSE_CHECKPOINT}"
-    exit 1
-fi
-
-case "${VITPOSE_CHECKPOINT}" in
-    *.pth|*.pt|*.ckpt) ;;
-    *)
-        echo "Error: MODEL.VITPOSE.CHECKPOINT must point to a weight file such as vitpose-b.pth, not a config .py file."
-        echo "Current checkpoint path: ${VITPOSE_CHECKPOINT}"
-        exit 1
-        ;;
-esac
-
-python - <<'PY'
-import mmpose
-from mmpose.apis import init_model, inference_topdown
-from mmpose.utils import register_all_modules
-print(f"MMPose import ok: {getattr(mmpose, '__file__', 'namespace-package')}")
-PY
-if [ $? -ne 0 ]; then
-    echo "Error: Python cannot import MMPose ViTPose APIs."
-    echo "Expected a full MMPose package at: ${MMPOSE_DIR}"
-    echo "Fix on the server with one of:"
-    echo "  git clone https://github.com/open-mmlab/mmpose.git ${MMPOSE_DIR}"
-    echo "  pip install -e ${MMPOSE_DIR}"
-    echo "and make sure mmcv, mmengine, mmpretrain, and mmdet are installed in the slhoi environment."
-    exit 1
-fi
-
 # --------- Training Phase ---------
 accelerate launch \
     --config_file "configs/accelerate_config.yaml" \
-    --num_processes=1 \
+    --num_processes=8 \
     --main_process_port=12847 \
     train.py \
     -c ${CONFIG_FILE} \
     --default-config ${DEFAULT_CONFIG} \
     SOLVER.BATCH_SIZE=2 \
     RUNTIME.OUTPUT_DIR="${EXP_DIR}" \
-    RUNTIME.NUM_WORKERS=0 \
+    RUNTIME.NUM_WORKERS=4 \
     INPUT.PATH="${DATA_DIR}" \
     MODEL.DINO.DINOTXT_WEIGHTS="${DINO_DIR}/dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth" \
     MODEL.DINO.BACKBONE_WEIGHTS="${DINO_DIR}/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth" \
@@ -97,12 +37,7 @@ accelerate launch \
     ZERO_SHOT.TYPE="rare_first" \
     ZERO_SHOT.DEL_UNSEEN="true" \
     ZERO_SHOT.CLASSIFIER.TRAIN="params/hico/classifier_rare_first.pt" \
-    ZERO_SHOT.CLASSIFIER.EVAL="params/hico/classifier_eval.pt" \
-    MODEL.RELATION_POSE_SCENE_ADAPTER.ENABLED="true" \
-    MODEL.VITPOSE.ENABLED="true" \
-    MODEL.VITPOSE.CONFIG="${VITPOSE_CONFIG}" \
-    MODEL.VITPOSE.CHECKPOINT="${VITPOSE_CHECKPOINT}" \
-    MODEL.VITPOSE.NUM_KEYPOINTS=17
+    ZERO_SHOT.CLASSIFIER.EVAL="params/hico/classifier_eval.pt"
 
 
 # --------- Evaluation Phase ---------

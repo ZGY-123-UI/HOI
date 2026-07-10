@@ -12,9 +12,9 @@ export DS_LOG_LEVEL=WARN
 export ACCELERATE_LOG_LEVEL=WARN
 
 # --------- Directory and Paths ---------
-EXP_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/exps1/swig"
-DATA_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/data/swig_hoi"
-DINO_DIR="/media/qdu/2.0T/zgy/projects/SL-HOI/weights/dinov3"
+EXP_DIR="exps/swig"
+DATA_DIR="/path/to/your/datasets/swig_hoi"
+DINO_DIR="/path/to/your/weights/dinov3"
 
 CONFIG_FILE="configs/swig.yaml"
 DEFAULT_CONFIG="configs/base.yaml"
@@ -22,16 +22,15 @@ DEFAULT_CONFIG="configs/base.yaml"
 # --------- Training Phase ---------
 accelerate launch \
     --config_file "configs/accelerate_config.yaml" \
-    --num_processes=1 \
+    --num_processes=8 \
     --main_process_port=12847 \
     train.py \
     -c ${CONFIG_FILE} \
     --default-config ${DEFAULT_CONFIG} \
-    SOLVER.BATCH_SIZE=2 \
+    SOLVER.BATCH_SIZE=32 \
     RUNTIME.OUTPUT_DIR="${EXP_DIR}" \
-    RUNTIME.NUM_WORKERS=0 \
+    RUNTIME.NUM_WORKERS=2 \
     INPUT.PATH="${DATA_DIR}" \
-    INPUT.REPEAT_FACTOR_SAMPLING=false \
     MODEL.DINO.DINOTXT_WEIGHTS="${DINO_DIR}/dinov3_vitl16_dinotxt_vision_head_and_text_encoder-a442d8f5.pth" \
     MODEL.DINO.BACKBONE_WEIGHTS="${DINO_DIR}/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth" \
     MODEL.DINO.BPE_PATH_OR_URL="${DINO_DIR}/bpe_simple_vocab_16e6.txt.gz" \

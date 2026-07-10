@@ -25,28 +25,6 @@ class SetCriterionHOI(nn.Module):
         self.register_buffer('empty_weight', empty_weight)
         self.alpha = cfg.LOSS.ALPHA_FOCAL_LOSS_HOI
 
-        clip_soft_cfg = cfg.LOSS.get("CLIP_SOFT_LABEL", {})
-        self.use_clip_soft_label = clip_soft_cfg.get("ENABLED", False)
-        self.clip_soft_mix_alpha = clip_soft_cfg.get("MIX_ALPHA", 0.0)
-        self.clip_soft_temperature = clip_soft_cfg.get("TEMPERATURE", 1.0)
-        if self.use_clip_soft_label:
-            clip_soft_path = clip_soft_cfg.get("PATH", "")
-            if not clip_soft_path:
-                raise ValueError("LOSS.CLIP_SOFT_LABEL.PATH must be set when CLIP soft label is enabled")
-            soft_data = torch.load(clip_soft_path, map_location="cpu", weights_only=True)
-            if "clip_soft_label" not in soft_data:
-                raise KeyError(f"clip soft label file must contain 'clip_soft_label': {clip_soft_path}")
-            self.register_buffer("clip_soft_label", soft_data["clip_soft_label"].float())
-        else:
-            self.clip_soft_label = None
-
-        prior_cfg = cfg.LOSS.get("HOI_PRIOR", {})
-        self.use_hoi_prior = prior_cfg.get("ENABLED", False)
-
-        union_clip_cfg = cfg.LOSS.get("UNION_CROP_CLIP_KD", {})
-        self.use_union_clip_kd = union_clip_cfg.get("ENABLED", False)
-        self.union_clip_temperature = union_clip_cfg.get("TEMPERATURE", 2.0)
-
     def loss_obj_labels(self, outputs, targets, indices, num_interactions, log=True):
         assert 'pred_obj_logits' in outputs
         src_logits = outputs['pred_obj_logits']
@@ -96,92 +74,13 @@ class SetCriterionHOI(nn.Module):
         target_classes_o = torch.cat([t['hoi_labels'][J] for t, (_, J) in zip(targets, indices)])
         target_classes_o = target_classes_o.to(src_logits.dtype)
         target_classes = torch.zeros_like(src_logits)
-        matched_train_targets = target_classes_o
-
-        if self.use_clip_soft_label:
-            clip_soft_label = self._get_clip_soft_label(src_logits)
-            if target_classes_o.numel() > 0:
-                clip_targets = target_classes_o @ clip_soft_label
-                clip_targets = torch.maximum(clip_targets, target_classes_o)
-                clip_targets = clip_targets.clamp(max=1.0)
-                mix_alpha = max(0.0, min(float(self.clip_soft_mix_alpha), 1.0))
-                # Stage 1: blend hard HOI labels with CLIP semantic soft labels before
-                # the main HOI focal loss, i.e. y_final = (1-a)*y_hard + a*y_clip.
-                matched_train_targets = ((1.0 - mix_alpha) * target_classes_o + mix_alpha * clip_targets).clamp(0.0, 1.0)
-
-        target_classes[idx] = matched_train_targets
-        src_prob = _sigmoid(src_logits)
-        loss_hoi_ce = self._neg_loss(src_prob, target_classes, weights=None, alpha=self.alpha)
+        target_classes[idx] = target_classes_o
+        src_logits = _sigmoid(src_logits)
+        loss_hoi_ce = self._neg_loss(src_logits, target_classes, weights=None, alpha=self.alpha)
         losses = {'loss_hoi_labels': loss_hoi_ce}
 
-        if self.use_clip_soft_label and log:
-            matched_logits = src_logits[idx]
-            if matched_logits.numel() > 0:
-                matched_soft_targets = matched_train_targets
-                pred_soft = torch.sigmoid(matched_logits / self.clip_soft_temperature)
-                loss_clip_soft = F.binary_cross_entropy(pred_soft, matched_soft_targets, reduction="mean")
-            else:
-                loss_clip_soft = src_logits.sum() * 0.0
-            losses["loss_hoi_clip_soft"] = loss_clip_soft
-
-        if self.use_hoi_prior and log:
-            if "hoi_prior_mask" not in outputs:
-                raise KeyError("HOI prior is enabled but outputs do not contain 'hoi_prior_mask'")
-            prior_mask = outputs["hoi_prior_mask"].to(device=src_logits.device, dtype=src_logits.dtype)
-            if prior_mask.shape != src_logits.shape:
-                raise ValueError(
-                    f"HOI prior mask dim mismatch: hoi_prior_mask={prior_mask.shape}, "
-                    f"pred_hoi_logits={src_logits.shape}"
-                )
-            # Stage 2: penalize probability mass assigned to HOI classes that the
-            # action-object feasibility bank marks as unlikely for the predicted object.
-            losses["loss_hoi_prior"] = (src_prob * (1.0 - prior_mask)).mean()
-
-        if self.use_union_clip_kd and log:
-            if "clip_union_teacher_logits" not in outputs:
-                raise KeyError("Union crop CLIP KD is enabled but outputs do not contain 'clip_union_teacher_logits'")
-            teacher_logits = outputs["clip_union_teacher_logits"].to(device=src_logits.device, dtype=src_logits.dtype)
-            if teacher_logits.shape != src_logits.shape:
-                raise ValueError(
-                    f"Union CLIP teacher dim mismatch: teacher={teacher_logits.shape}, "
-                    f"pred_hoi_logits={src_logits.shape}"
-                )
-            temperature = self.union_clip_temperature
-            # Stage 4: distill union-crop CLIP image/text contrastive logits into
-            # the student HOI logits without changing the detector matching path.
-            loss_union_clip = F.kl_div(
-                F.log_softmax(src_logits / temperature, dim=-1),
-                F.softmax(teacher_logits / temperature, dim=-1),
-                reduction="batchmean",
-            ) * (temperature ** 2)
-            losses["loss_union_clip_kd"] = loss_union_clip
-
-        if "pred_hoi_masked_logits" in outputs:
-            masked_logits = outputs["pred_hoi_masked_logits"]
-            if masked_logits.shape != src_logits.shape:
-                raise ValueError(
-                    f"HOI masked semantic logits dim mismatch: masked={masked_logits.shape}, "
-                    f"pred_hoi_logits={src_logits.shape}"
-                )
-            masked_prob = _sigmoid(masked_logits)
-            losses["loss_hoi_masked_semantic"] = self._neg_loss(
-                masked_prob, target_classes, weights=None, alpha=self.alpha
-            )
-
-        if "pred_ctx_hoi_logits" in outputs and log:
-            ctx_logits = outputs["pred_ctx_hoi_logits"]
-            if ctx_logits.shape != src_logits.shape:
-                raise ValueError(
-                    f"HOI context semantic logits dim mismatch: context={ctx_logits.shape}, "
-                    f"pred_hoi_logits={src_logits.shape}"
-                )
-            ctx_prob = _sigmoid(ctx_logits)
-            losses["loss_visual_text_consistency"] = self._neg_loss(
-                ctx_prob, target_classes, weights=None, alpha=self.alpha
-            )
-
         if log:
-            _, pred = src_prob[idx].topk(topk, 1, True, True)
+            _, pred = src_logits[idx].topk(topk, 1, True, True)
             acc = 0.0
             for tid, target in enumerate(target_classes_o):
                 tgt_idx = torch.where(target == 1)[0]
@@ -195,15 +94,6 @@ class SetCriterionHOI(nn.Module):
             losses['hoi_class_error'] = torch.from_numpy(np.array(
                 rel_labels_error)).to(src_logits.device).float()
         return losses
-
-    def _get_clip_soft_label(self, src_logits):
-        clip_soft_label = self.clip_soft_label.to(device=src_logits.device, dtype=src_logits.dtype)
-        if clip_soft_label.shape[0] != src_logits.shape[-1] or clip_soft_label.shape[1] != src_logits.shape[-1]:
-            raise ValueError(
-                f"CLIP soft label dim mismatch: clip_soft_label={clip_soft_label.shape}, "
-                f"pred_hoi_logits={src_logits.shape}"
-            )
-        return clip_soft_label
 
     def loss_sub_obj_boxes(self, outputs, targets, indices, num_interactions):
         assert 'pred_sub_boxes' in outputs and 'pred_obj_boxes' in outputs
@@ -239,10 +129,8 @@ class SetCriterionHOI(nn.Module):
         ''' Modified focal loss. Exactly the same as CornerNet.
           Runs faster and costs a little bit more memory
         '''
-        # Stage 1/5: soft labels are fractional, so positives/negatives are
-        # weighted by the target value instead of using only gt == 1 masks.
-        pos_inds = gt.float()
-        neg_inds = (1.0 - gt).clamp(min=0.0)
+        pos_inds = gt.eq(1).float()
+        neg_inds = gt.lt(1).float()
 
         loss = 0
 
@@ -297,13 +185,6 @@ class SetCriterionHOI(nn.Module):
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_interactions))
-        for scalar_loss in (
-            "loss_semantic_consistency",
-            "loss_mask_recovery",
-            "loss_global_proto_consistency",
-        ):
-            if scalar_loss in outputs_without_aux:
-                losses[scalar_loss] = outputs_without_aux[scalar_loss]
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
